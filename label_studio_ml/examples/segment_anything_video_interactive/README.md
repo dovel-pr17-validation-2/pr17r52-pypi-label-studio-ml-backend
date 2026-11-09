@@ -1,0 +1,170 @@
+# Segment Anything — Video Interactive (SAM2) ML Backend
+
+An interactive ML backend that mirrors the in-browser BYOM SAM tag in Label
+Studio Enterprise. Accepts click / box / multi-frame prompts, returns
+bitmask / rectangle / polygon / video-rectangle results via the standard
+`/predict` endpoint.
+
+## What's different from `segment_anything_2_video`
+
+- **Dual mode** — image and video under one backend, dispatched on the label
+  config's object tag.
+- **Prewarm + sticky frame cache** — frames are encoded in a window around the
+  user's current frame in the navigation direction. Nothing is re-encoded
+  unless a memory cap forces eviction. Spatial eviction drops frames furthest
+  from the current frame first.
+- **Per-task state** — no process-wide globals for inference state, so
+  concurrent requests across tasks don't clobber each other.
+- **Standard `PredictionValue` output** — no custom wire protocol; the Label
+  Studio tag consumes the exact shape any other interactive ML backend emits.
+
+## Wire protocol
+
+Two modes multiplex through `/predict`, selected by `context.event`:
+
+### Prewarm
+
+```json
+{
+  "tasks": [{"id": 1, "data": {"video": "..."}}],
+  "params": {
+    "context": {
+      "event": "prewarm",
+      "frame": 42,
+      "window": 20,
+      "direction": "forward"
+    }
+  }
+}
+```
+
+Response `results[0].value`: `{"status": "ok", "cached": [...], "pending": [...], "frame_count": N}`.
+
+### Predict
+
+```json
+{
+  "tasks": [{"id": 1, "data": {"video": "..."}}],
+  "params": {
+    "context": {
+      "frame": 42,
+      "result": [
+        {"type": "keypointlabels", "value": {"x": 45.2, "y": 30.1, "positive": true}},
+        {"type": "keypointlabels", "value": {"x": 60.0, "y": 55.0, "positive": false}}
+      ]
+    }
+  }
+}
+```
+
+Response: standard `PredictionValue` with `result[0].value` shaped for the
+project's control tag.
+
+## Configuration (env)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEVICE` | `cuda` | `cuda`, `mps`, or `cpu` |
+| `MODEL_CONFIG` | `configs/sam2.1/sam2.1_hiera_l.yaml` | SAM2 config name (Hydra path inside the SAM2 repo). Size must match the checkpoint |
+| `MODEL_CHECKPOINT` | `sam2.1_hiera_large.pt` | SAM2 checkpoint filename. For tiny: config `configs/sam2.1/sam2.1_hiera_t.yaml` + checkpoint `sam2.1_hiera_tiny.pt` |
+| `WINDOW_SIZE` | `20` | default prewarm window if client omits `window` |
+| `MAX_PREWARM_WINDOW` | `20` | hard cap for client-requested prewarm `window` |
+| `MAX_BATCH_DECODE_FRAMES` | `16` | max contiguous raw frames decoded per prewarm batch before splitting work |
+| `MAX_CACHED_FRAMES_PER_TASK` | `500` | hard frame-count ceiling per task |
+| `MAX_TASK_CACHE_MB` | `2048` | hard byte ceiling per task |
+| `MAX_GLOBAL_CACHE_MB` | `8192` | hard byte ceiling across all tasks |
+| `TASK_CACHE_TTL_SECONDS` | `1800` | drop idle task caches after this long |
+| `FRAME_ENCODER_WORKERS` | `1` | max concurrent frame-embedding encodes; keep at 1 for one GPU to avoid memory spikes |
+| `TRACK_SESSION_TTL_SECONDS` | `300` | drop completed/cancelled tracking sessions after this idle period |
+| `TRACK_SESSION_MAX_AGE_SECONDS` | `1800` | cancel/drop abandoned tracking sessions after this absolute age |
+| `TRACKING_WORKERS` | `1` | max concurrent SAM2 video propagation jobs per process |
+| `MAX_TRACKING_SESSIONS` | `1` | max active + queued tracking sessions; extra track requests return busy |
+| `TRACKING_RELEASE_MEMORY` | `1` | after each tracking job, tear down SAM2 state and trim PyTorch allocator caches so RSS can drop |
+| `TRACKING_ON_DEMAND_FRAMES` | `1` | decode SAM2 tracking frames on demand with a tiny LRU instead of caching every resized frame tensor |
+| `TRACKING_FRAME_CACHE_SIZE` | `2` | number of normalized frame tensors to keep during on-demand tracking |
+| `LS_FETCH_RETRY_ATTEMPTS` | `4` | ffmpeg/ffprobe retries on an LS HTTP 429 |
+| `LS_FETCH_RETRY_BASE_DELAY` | `1.0` | base backoff (s) between 429 retries (exponential + jitter) |
+| `LS_FETCH_RETRY_MAX_DELAY` | `30.0` | cap (s) on a single backoff delay |
+| `LABEL_STUDIO_URL` / `LABEL_STUDIO_API_KEY` | — | needed to fetch task assets from LS |
+
+The backend enforces `WORKERS=1` at startup because the model, accelerator
+semaphore, video registry, and frame cache are process-local and this example is
+intended for a single GPU.
+
+`LABEL_STUDIO_API_KEY` accepts either token type:
+
+- **Legacy token** — sent as-is (`Authorization: Token …`).
+- **Personal Access Token (PAT)** — a JWT refresh token; the backend exchanges
+  it at `LABEL_STUDIO_URL/api/token/refresh` for a short-lived access JWT
+  (`Authorization: Bearer …`), caching and auto-refreshing it before expiry.
+  Requires `LABEL_STUDIO_URL` to be set so the refresh endpoint is reachable.
+
+Cloud-backed projects put the raw provider URI in task data (`s3://bucket/key.mp4`,
+`gs://…`, `azure-blob://…`). Those can't be streamed — only LS can resolve them,
+via `/tasks/<id>/presign/` — so the backend downloads them through the SDK and
+decodes locally. LS-hosted uploads are also downloaded through the SDK rather
+than streamed with auth headers: ffmpeg forwards custom headers across redirects,
+which can leak the LS token if the response redirects to another origin. External
+HTTP(S) assets are still range-streamed without LS auth.
+
+## Running locally (no Docker)
+
+1. Clone SAM2 next to this example:
+   ```bash
+   cd label_studio_ml/examples/segment_anything_video_interactive
+   git clone https://github.com/facebookresearch/segment-anything-2.git
+   (cd segment-anything-2 && git checkout 2b90b9f5ceec907a1c18123530e92e794ad901a4 && pip install -e . && cd checkpoints && ./download_ckpts.sh)
+   ```
+2. Install backend requirements (from the repo root):
+   ```bash
+   pip install -e .
+   pip install -r label_studio_ml/examples/segment_anything_video_interactive/requirements.txt
+   ```
+3. Start the dev server:
+   ```bash
+   cd label_studio_ml/examples/segment_anything_video_interactive
+   export DEVICE=mps            # on Apple Silicon, or keep cuda on NVIDIA
+   export LABEL_STUDIO_URL=http://host.docker.internal:8080
+   export LABEL_STUDIO_API_KEY=<your LSE API key>
+   python _wsgi.py -p 9090
+   ```
+
+## Running via Docker
+
+```bash
+cd label_studio_ml/examples/segment_anything_video_interactive
+# fill in LABEL_STUDIO_URL / LABEL_STUDIO_API_KEY in docker-compose.yml first
+docker compose up --build
+```
+
+The service listens on `:9090`.
+
+## Connecting to Label Studio Enterprise
+
+1. In LSE → **Settings → Model** → **Connect Model**.
+2. URL: `http://host.docker.internal:9090` (or wherever the backend is
+   reachable from the LSE container).
+3. Toggle **Interactive preannotations** ON.
+4. Save. LSE will POST `/setup` and `/health` to verify.
+
+## Verifying
+
+```bash
+curl -s localhost:9090/health
+# {"status":"UP","model_class":"SamVideoInteractive"}
+
+curl -s localhost:9090/predict -H 'content-type: application/json' -d '{
+  "tasks":[{"id":1,"data":{"video":"https://..."}}],
+  "project":"1.1700000000",
+  "label_config":"<View><Video name=\"video\" value=\"$video\"/><VideoRectangle name=\"box\" toName=\"video\"/></View>",
+  "params":{"context":{"event":"prewarm","frame":0,"window":10,"direction":"forward"}}
+}' | jq
+```
+
+## Known gaps
+
+- **SAM2 video predictor integration** — the prewarm pipeline currently caches
+  per-frame image embeddings via the SAM2 image predictor. True video
+  tracking with memory propagation is in the next iteration.
+- **MPS device** — SAM2 has partial MPS support; fall back to `DEVICE=cpu` on
+  Apple Silicon if you hit op-not-implemented errors.
